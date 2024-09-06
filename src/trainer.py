@@ -12,7 +12,8 @@ from util import (
     MetricMeter,
     SLATrainerConfig,
 )
-
+from logitadjust import LogitAdjust
+from proco import ProCoLoss
 
 class BaseDATrainer:
     def __init__(self, loaders, args, backbone="resnet34"):
@@ -25,7 +26,7 @@ class BaseDATrainer:
             nesterov=True,
         )
         self.lr_scheduler = LR_Scheduler(self.optimizer, args.num_iters)
-
+        self.delta = args.delta
         # `self.iter_loaders` is used to load the training data. However, during evaluation or testing,
         # we need to pass a specific data loader that is not available in an iterator.
         self.loaders = loaders
@@ -36,6 +37,8 @@ class BaseDATrainer:
 
         # required arguments for DATrainer
         self.config = BaseTrainerConfig.from_args(args)
+        self.criterion_ce = LogitAdjust(tau=args.tau).cuda()
+        self.criterion_scl = ProCoLoss(contrast_dim=65, temperature=args.temprature, num_classes=args.dataset["num_classes"]).cuda()
 
     def get_source_loss(self, step, *data):
         return self.model.base_loss(*data)
@@ -69,12 +72,14 @@ class BaseDATrainer:
         self.optimizer.zero_grad()
         s_loss = self.get_source_loss(step, sx, sy)
         t_loss = self.get_target_loss(step, tx, ty)
-
-        loss = (s_loss + t_loss) / 2
+        contrast_logits_source = self.criterion_scl(self.model(sx), sy)
+        contrast_logits_target = self.criterion_scl(self.model(tx), ty)
+        scl_loss = (self.criterion_ce(contrast_logits_source, sy) + self.criterion_ce(contrast_logits_target, ty)) / self.delta
+        loss = (s_loss + t_loss) / 2 + scl_loss
         loss.backward()
         self.optimizer.step()
 
-        return s_loss.item(), t_loss.item(), 0
+        return s_loss.item(), t_loss.item(), scl_loss.item(), 0
 
     def train(self):
         self.model.train()
@@ -82,7 +87,7 @@ class BaseDATrainer:
         self.meter.start_time = time.perf_counter()
         for step in range(1, self.config.num_iters + 1):
             (sx, sy), (tx, ty), ux = next(self.iter_loaders)
-            s_loss, t_loss, u_loss = self.training_step(step, sx, sy, tx, ty, ux)
+            s_loss, t_loss, u_loss, scl_loss = self.training_step(step, sx, sy, tx, ty, ux)
             self.lr_scheduler.step()
 
             # logging
@@ -93,6 +98,7 @@ class BaseDATrainer:
                         "LR": self.lr_scheduler.get_lr(),
                         "source loss": s_loss,
                         "target loss": t_loss,
+                        "scl_loss(ours)": scl_loss,
                         "unlabeled loss": u_loss,
                     },
                 )
@@ -131,9 +137,9 @@ class UnlabeledDATrainer(BaseDATrainer):
         return u_loss.item()
 
     def training_step(self, step, sx, sy, tx, ty, ux):
-        s_loss, t_loss, _ = super().training_step(step, sx, sy, tx, ty, ux)
+        s_loss, t_loss, scl_loss, _ = super().training_step(step, sx, sy, tx, ty, ux)
         u_loss = self.unlabeled_training_step(step, ux)
-        return s_loss, t_loss, u_loss
+        return s_loss, t_loss, u_loss, scl_loss
 
 
 def get_SLA_trainer(base_class):
@@ -161,10 +167,10 @@ def get_SLA_trainer(base_class):
                 self.ppc.init(self.model, self.loaders.loaders["target_unlabeled_test"])
 
         def training_step(self, step, *data):
-            s_loss, t_loss, u_loss = super().training_step(step, *data)
+            s_loss, t_loss, u_loss, scl_loss = super().training_step(step, *data)
             self.ppc_update(step)
 
-            return s_loss, t_loss, u_loss
+            return s_loss, t_loss, u_loss, scl_loss
 
     return SLADATrainer
 
